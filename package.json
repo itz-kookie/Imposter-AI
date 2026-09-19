@@ -1,0 +1,16 @@
+{
+  "name": "imposter-game",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["web", "worker"],
+  "scripts": {
+    "dev:web": "npm run dev --workspace web",
+    "dev:worker": "npm run dev --workspace worker",
+    "build": "npm run build --workspace web && npm run build --workspace worker",
+    "typecheck": "npm run typecheck --workspace web && npm run typecheck --workspace worker"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
+
