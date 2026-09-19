@@ -4,7 +4,7 @@ A local-first social deduction word game with Gemini-powered opponents. The brow
 
 ## Requirements
 
-- Node.js 20 or newer
+- Node.js 22 or newer
 - A Gemini API key
 
 ## Run locally
