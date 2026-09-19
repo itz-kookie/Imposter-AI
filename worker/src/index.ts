@@ -5,16 +5,23 @@ interface Env {
   GEMINI_MODEL?: string;
 }
 
-const ALLOWED_ORIGIN = "http://localhost:5173";
+// In production the web app is served by this same Worker, so requests are same-origin and need no CORS.
+// During local development Vite runs on a separate port, so we allow those origins explicitly.
+const DEV_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:5173"]);
 
-const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), {
-  status,
-  headers: {
-    "content-type": "application/json; charset=utf-8",
-    "access-control-allow-origin": ALLOWED_ORIGIN,
+const corsHeaders = (request: Request): Record<string, string> => {
+  const origin = request.headers.get("origin");
+  if (!origin || !DEV_ORIGINS.has(origin)) return {};
+  return {
+    "access-control-allow-origin": origin,
     "access-control-allow-headers": "content-type",
     "access-control-allow-methods": "GET,POST,OPTIONS"
-  }
+  };
+};
+
+const json = (request: Request, data: unknown, status = 200) => new Response(JSON.stringify(data), {
+  status,
+  headers: { "content-type": "application/json; charset=utf-8", ...corsHeaders(request) }
 });
 
 class ApiError extends Error {
@@ -29,7 +36,7 @@ function oneWord(value: unknown): string | null {
 }
 
 async function callGemini<T>(env: Env, prompt: string, schema: object): Promise<T> {
-  const model = env.GEMINI_MODEL || "gemini-2.5-flash-lite";
+  const model = env.GEMINI_MODEL || "gemini-3.5-flash-lite";
   const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
@@ -119,21 +126,21 @@ async function generateVote(env: Env, input: BotVoteRequest): Promise<BotVoteRes
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    if (request.method === "OPTIONS") return json({ ok: true });
+    if (request.method === "OPTIONS") return json(request, { ok: true });
     const url = new URL(request.url);
 
     if (url.pathname === "/api/health" && request.method === "GET") {
-      return json({ ok: true, geminiConfigured: Boolean(env.GEMINI_API_KEY) });
+      return json(request, { ok: true, geminiConfigured: Boolean(env.GEMINI_API_KEY) });
     }
 
     if (url.pathname === "/api/bot/clue" && request.method === "POST") {
       try {
         const input = await request.json<BotClueRequest>();
         if (!env.GEMINI_API_KEY) throw new ApiError("Gemini is not configured", 503);
-        return json(await generateClue(env, input));
+        return json(request, await generateClue(env, input));
       } catch (error) {
         const apiError = error instanceof ApiError ? error : new ApiError("Invalid request", 400);
-        return json({ error: apiError.message }, apiError.status);
+        return json(request, { error: apiError.message }, apiError.status);
       }
     }
 
@@ -141,13 +148,13 @@ export default {
       try {
         const input = await request.json<BotVoteRequest>();
         if (!env.GEMINI_API_KEY) throw new ApiError("Gemini is not configured", 503);
-        return json(await generateVote(env, input));
+        return json(request, await generateVote(env, input));
       } catch (error) {
         const apiError = error instanceof ApiError ? error : new ApiError("Invalid request", 400);
-        return json({ error: apiError.message }, apiError.status);
+        return json(request, { error: apiError.message }, apiError.status);
       }
     }
 
-    return json({ error: "Not found" }, 404);
+    return json(request, { error: "Not found" }, 404);
   }
 } satisfies ExportedHandler<Env>;

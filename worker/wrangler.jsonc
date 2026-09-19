@@ -5,6 +5,15 @@
   "compatibility_date": "2026-09-19",
   "observability": {
     "enabled": true
+  },
+  // The built web app is served from this Worker. Build it first: `npm run build` at the repo root.
+  "assets": {
+    "directory": "../web/dist",
+    "not_found_handling": "single-page-application",
+    // Only /api/* reaches the Worker code; everything else is answered by the asset server.
+    "run_worker_first": ["/api/*"]
   }
+  // Custom domain: either attach it in the Cloudflare dashboard (Worker -> Settings -> Domains & Routes),
+  // or uncomment below and replace the hostname. Both work; the dashboard setting survives deploys.
+  // ,"routes": [{ "pattern": "play.example.com", "custom_domain": true }]
 }
-
