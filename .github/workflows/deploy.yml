@@ -47,6 +47,19 @@ jobs:
         with:
           name: web-dist
           path: web/dist
+      - name: Select AI provider
+        id: ai
+        # AI_PROVIDER is a GitHub repository variable (Settings -> Secrets and variables -> Actions -> Variables).
+        # Only the secret for the selected provider is uploaded, because wrangler-action fails on an empty secret.
+        env:
+          AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
+        run: |
+          case "$AI_PROVIDER" in
+            gemini)  echo "secret=GEMINI_API_KEY"  >> "$GITHUB_OUTPUT"; echo "vars=AI_PROVIDER" >> "$GITHUB_OUTPUT" ;;
+            mistral) echo "secret=MISTRAL_API_KEY" >> "$GITHUB_OUTPUT"; echo "vars=AI_PROVIDER" >> "$GITHUB_OUTPUT" ;;
+            openai)  echo "secret=OPENAI_API_KEY"  >> "$GITHUB_OUTPUT"; printf 'vars<<EOF\nAI_PROVIDER\nOPENAI_BASE_URL\nOPENAI_MODEL\nEOF\n' >> "$GITHUB_OUTPUT" ;;
+            *) echo "Unknown AI_PROVIDER '$AI_PROVIDER' (expected gemini, mistral or openai)" >&2; exit 1 ;;
+          esac
       - name: Deploy Worker with static assets
         uses: cloudflare/wrangler-action@v3
         with:
@@ -54,7 +67,12 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: worker
           command: deploy
-          secrets: |
-            GEMINI_API_KEY
+          vars: ${{ steps.ai.outputs.vars }}
+          secrets: ${{ steps.ai.outputs.secret }}
         env:
+          AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || 'https://api.openai.com/v1' }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}

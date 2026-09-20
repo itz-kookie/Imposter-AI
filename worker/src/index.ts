@@ -1,9 +1,6 @@
 import type { BotClueRequest, BotClueResponse, BotVoteRequest, BotVoteResponse } from "../../shared/game";
-
-interface Env {
-  GEMINI_API_KEY: string;
-  GEMINI_MODEL?: string;
-}
+import { cluePrompt, votePrompt } from "./prompts";
+import { createProvider, selectedProviderName, PROVIDER_NAMES, ProviderError, type AiProvider, type Env, type GenerateOptions, type JsonSchema } from "./providers";
 
 // In production the web app is served by this same Worker, so requests are same-origin and need no CORS.
 // During local development Vite runs on a separate port, so we allow those origins explicitly.
@@ -32,124 +29,61 @@ function oneWord(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const cleaned = value.trim().replace(/[.,!?;:'"()[\]{}]/g, "");
   if (!cleaned || /\s/.test(cleaned) || cleaned.length > 24) return null;
+  // Reject phrases glued together to dodge the one-word rule: "DeepDish", "walk-like-an-egyptian", "Tour_de_France".
+  if (/[-_]/.test(cleaned) || /\p{Ll}\p{Lu}/u.test(cleaned)) return null;
   return cleaned;
 }
 
-async function callGemini<T>(env: Env, prompt: string, schema: object): Promise<T> {
-  const model = env.GEMINI_MODEL || "gemini-3.5-flash-lite";
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.85,
-        maxOutputTokens: 200,
-        responseMimeType: "application/json",
-        responseJsonSchema: schema
-      }
-    })
-  });
-
-  if (!response.ok) {
-    const detail = await response.text();
-    console.error("Gemini error", response.status, detail.slice(0, 300));
-    throw new ApiError(response.status === 429 ? "Gemini is busy. Try again shortly." : "Gemini request failed", 502);
-  }
-
-  const payload = await response.json<any>();
-  const text = payload?.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new ApiError("Gemini returned an empty response", 502);
-  try { return JSON.parse(text) as T; }
-  catch { throw new ApiError("Gemini returned invalid JSON", 502); }
-}
-
-const DIFFICULTY_RULES: Record<BotClueRequest["difficulty"], string> = {
-  gentle: `GENTLE: Direct associations are allowed (a part, a use, a place it is found). Avoid only synonyms and near-spellings of the secret word.`,
-  standard: `STANDARD: Forbidden: parts or components of the thing, its primary function, its defining features, where it is typically found, and synonyms. Allowed: side associations, moods, situations, or things loosely paired with it. Your clue should fit at least two or three other words in the category.`,
-  devious: `DEVIOUS: Only oblique, second-order associations. Think of a memory, a feeling, a cultural reference, or something two steps removed. A stranger reading your clue alone should be unable to guess the category, let alone the word. Only someone who already knows the word should feel the click.`
-};
-
-function cluePrompt(input: BotClueRequest, correction = ""): string {
-  const round = input.previousClues.reduce((max, c) => Math.max(max, c.round), 1);
-  const history = input.previousClues.length
-    ? input.previousClues.map(c => `${c.playerName} (round ${c.round}): ${c.word}`).join("\n")
-    : "No clues have been given yet.";
-
-  const roleBrief = input.role === "player"
-    ? `You KNOW the secret word: "${input.secretWord}" (category: ${input.category}).
-
-THREAT MODEL: One player at the table is an imposter who does not know the word. The imposter sees the category and every clue, and will try to piece the word together. If your clue lets someone derive the word from the category plus clues, you have handed the game to the imposter. Your goal is a clue that only makes sense AFTER you know the word, never one that points toward it.
-
-Example for secret word "Pizza": "Slice", "Oven", "Cheese" are BAD because they lead straight to the answer. "Friday", "Argument", "Cardboard" are GOOD because they are meaningless to the imposter but click for anyone who knows the word.
-
-Difficulty rules you must follow:
-${DIFFICULTY_RULES[input.difficulty]}
-
-Do not repeat the theme of an earlier clue. If earlier clues already point in one direction, pick a different angle. This is round ${round}; with each round the imposter has more information, so be more oblique than the clues before you.`
-    : `You are the IMPOSTER. You do NOT know the secret word. You only know the category: "${input.category}".
-
-Study the clues so far and form a private guess about what the word might be. Then give a clue that would plausibly fit that guess AND also fit several other words in the category, so you blend in whether or not your guess is right. Avoid generic words that fit anything (e.g. "Nice", "Thing", "Good"), because real players will notice you are hedging. Mirror the specificity level of the other clues.`;
-
-  return `You are ${input.playerName} in a social deduction word game. Each player says exactly one word as a clue.
-
-${roleBrief}
-
-Hard rules:
-- Exactly one word, no spaces, no hyphenated compounds.
-- Never use the secret word, any part of it, a plural, a translation, a rhyme, or an obvious spelling variant.
-- Never repeat a word already used as a clue.
-
-Clues so far:
-${history}
-${correction}
-
-First write one sentence in "reason" explaining why the imposter could not derive the word from this clue (or, as imposter, why this clue blends in). Then give the clue in "clue". Return JSON only.`;
-}
-
-async function generateClue(env: Env, input: BotClueRequest): Promise<BotClueResponse> {
+async function generateClue(ai: AiProvider, input: BotClueRequest): Promise<BotClueResponse> {
   if (!input.playerName || !input.category || !Array.isArray(input.previousClues)) throw new ApiError("Invalid clue request", 400);
   if (input.role === "player" && !input.secretWord) throw new ApiError("Player is missing the secret word", 400);
   const used = new Set(input.previousClues.map(c => c.word.toLowerCase()));
-  const schema = { type: "object", properties: { reason: { type: "string" }, clue: { type: "string" } }, required: ["reason", "clue"], additionalProperties: false, propertyOrdering: ["reason", "clue"] };
+  // "reason" comes first so the model thinks before it picks the clue. Only the clue is returned to the client.
+  const schema: JsonSchema = { type: "object", properties: { reason: { type: "string" }, clue: { type: "string" } }, required: ["reason", "clue"], additionalProperties: false };
   let correction = "";
   for (let attempt = 0; attempt < 2; attempt++) {
-    const result = await callGemini<BotClueResponse & { reason?: string }>(env, cluePrompt(input, correction), schema);
+    const result = await generateJsonWithRetry<BotClueResponse & { reason?: string }>(ai, cluePrompt(input, correction), schema);
     const clue = oneWord(result.clue);
     const secret = input.secretWord?.toLowerCase();
     const lower = clue?.toLowerCase() ?? "";
     const revealsSecret = Boolean(secret && (lower === secret || lower.includes(secret) || secret.includes(lower)));
     if (clue && !revealsSecret && !used.has(lower)) return { clue };
-    correction = `\nYour previous answer "${result.clue}" was rejected: it was not a single word, repeated an earlier clue, or contained the secret word. Choose a completely different single word.`;
+    correction = `\nYour previous answer "${result.clue}" was rejected: it was not a single plain word (no glued-together phrases, hyphens, or capitals mid-word), repeated an earlier clue, or contained the secret word. Choose a completely different single word.`;
   }
-  throw new ApiError("Gemini could not produce a valid clue", 502);
+  throw new ApiError(`${ai.name} could not produce a valid clue`, 502);
 }
 
-function votePrompt(input: BotVoteRequest): string {
-  const knowledge = input.role === "player"
-    ? `You know the secret word is "${input.secretWord}" in category "${input.category}".`
-    : `You are the imposter and know only the category "${input.category}". Deflect suspicion without voting for yourself.`;
-  const history = input.clues.map(c => `${c.playerName} (round ${c.round}): ${c.word}`).join("\n");
-  const candidates = input.candidates.map(p => `${p.id}: ${p.name}`).join("\n");
-  return `You are ${input.playerName} voting in a social deduction game. ${knowledge}
-Review the clues and select the single most suspicious candidate. You cannot vote for yourself.
-
-Clues:
-${history}
-
-Candidates:
-${candidates}
-
-Return JSON only with the exact candidate id in playerId.`;
-}
-
-async function generateVote(env: Env, input: BotVoteRequest): Promise<BotVoteResponse> {
+async function generateVote(ai: AiProvider, input: BotVoteRequest): Promise<BotVoteResponse> {
   if (!input.playerId || !Array.isArray(input.candidates) || !input.candidates.length) throw new ApiError("Invalid vote request", 400);
   const allowed = new Set(input.candidates.filter(p => p.id !== input.playerId).map(p => p.id));
-  const schema = { type: "object", properties: { playerId: { type: "string", enum: [...allowed] } }, required: ["playerId"], additionalProperties: false };
-  const result = await callGemini<BotVoteResponse>(env, votePrompt(input), schema);
-  if (!allowed.has(result.playerId)) throw new ApiError("Gemini selected an invalid player", 502);
-  return result;
+  // "reason" first so the model weighs the clues before committing to a vote. Only playerId is returned.
+  const schema: JsonSchema = { type: "object", properties: { reason: { type: "string" }, playerId: { type: "string", enum: [...allowed] } }, required: ["reason", "playerId"], additionalProperties: false };
+  const result = await generateJsonWithRetry<BotVoteResponse & { reason?: string }>(ai, votePrompt(input), schema, { temperature: 0.5 });
+  if (!allowed.has(result.playerId)) throw new ApiError(`${ai.name} selected an invalid player`, 502);
+  return { playerId: result.playerId };
+}
+
+// Small models occasionally ramble past the token limit and return truncated JSON. One retry fixes almost all cases.
+async function generateJsonWithRetry<T>(ai: AiProvider, prompt: string, schema: JsonSchema, options?: GenerateOptions): Promise<T> {
+  try { return await ai.generateJson<T>(prompt, schema, options); }
+  catch (error) {
+    if (error instanceof ProviderError && /invalid JSON/.test(error.message)) return ai.generateJson<T>(prompt, schema, options);
+    throw error;
+  }
+}
+
+function toApiError(error: unknown): ApiError {
+  if (error instanceof ApiError) return error;
+  if (error instanceof ProviderError) return new ApiError(error.message, error.status);
+  return new ApiError("Invalid request", 400);
+}
+
+function requireProvider(env: Env): AiProvider {
+  const ai = createProvider(env);
+  if (ai) return ai;
+  const name = selectedProviderName(env);
+  const reason = PROVIDER_NAMES.includes(name) ? `${name} credentials are missing` : `unknown AI_PROVIDER "${name}" (expected one of ${PROVIDER_NAMES.join(", ")})`;
+  throw new ApiError(`AI provider is not configured: ${reason}`, 503);
 }
 
 export default {
@@ -158,16 +92,16 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/api/health" && request.method === "GET") {
-      return json(request, { ok: true, geminiConfigured: Boolean(env.GEMINI_API_KEY) });
+      const ai = createProvider(env);
+      return json(request, { ok: true, provider: selectedProviderName(env), configured: Boolean(ai), model: ai?.model ?? null });
     }
 
     if (url.pathname === "/api/bot/clue" && request.method === "POST") {
       try {
         const input = await request.json<BotClueRequest>();
-        if (!env.GEMINI_API_KEY) throw new ApiError("Gemini is not configured", 503);
-        return json(request, await generateClue(env, input));
+        return json(request, await generateClue(requireProvider(env), input));
       } catch (error) {
-        const apiError = error instanceof ApiError ? error : new ApiError("Invalid request", 400);
+        const apiError = toApiError(error);
         return json(request, { error: apiError.message }, apiError.status);
       }
     }
@@ -175,10 +109,9 @@ export default {
     if (url.pathname === "/api/bot/vote" && request.method === "POST") {
       try {
         const input = await request.json<BotVoteRequest>();
-        if (!env.GEMINI_API_KEY) throw new ApiError("Gemini is not configured", 503);
-        return json(request, await generateVote(env, input));
+        return json(request, await generateVote(requireProvider(env), input));
       } catch (error) {
-        const apiError = error instanceof ApiError ? error : new ApiError("Invalid request", 400);
+        const apiError = toApiError(error);
         return json(request, { error: apiError.message }, apiError.status);
       }
     }
