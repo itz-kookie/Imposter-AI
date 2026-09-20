@@ -44,7 +44,7 @@ async function callGemini<T>(env: Env, prompt: string, schema: object): Promise<
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       generationConfig: {
         temperature: 0.85,
-        maxOutputTokens: 80,
+        maxOutputTokens: 200,
         responseMimeType: "application/json",
         responseJsonSchema: schema
       }
@@ -64,35 +64,63 @@ async function callGemini<T>(env: Env, prompt: string, schema: object): Promise<
   catch { throw new ApiError("Gemini returned invalid JSON", 502); }
 }
 
+const DIFFICULTY_RULES: Record<BotClueRequest["difficulty"], string> = {
+  gentle: `GENTLE: Direct associations are allowed (a part, a use, a place it is found). Avoid only synonyms and near-spellings of the secret word.`,
+  standard: `STANDARD: Forbidden: parts or components of the thing, its primary function, its defining features, where it is typically found, and synonyms. Allowed: side associations, moods, situations, or things loosely paired with it. Your clue should fit at least two or three other words in the category.`,
+  devious: `DEVIOUS: Only oblique, second-order associations. Think of a memory, a feeling, a cultural reference, or something two steps removed. A stranger reading your clue alone should be unable to guess the category, let alone the word. Only someone who already knows the word should feel the click.`
+};
+
 function cluePrompt(input: BotClueRequest, correction = ""): string {
-  const knowledge = input.role === "player"
-    ? `You know the secret word is "${input.secretWord}".`
-    : `You are the imposter. You do not know the secret word. You only know the category is "${input.category}".`;
+  const round = input.previousClues.reduce((max, c) => Math.max(max, c.round), 1);
   const history = input.previousClues.length
     ? input.previousClues.map(c => `${c.playerName} (round ${c.round}): ${c.word}`).join("\n")
     : "No clues have been given yet.";
-  return `You are ${input.playerName} in a social deduction word game. ${knowledge}
-Difficulty: ${input.difficulty}. Give exactly one subtle clue word. It should help real players believe you know the word, but must not reveal the answer. Never repeat an earlier clue. Never use the secret word itself or a direct form of it.
+
+  const roleBrief = input.role === "player"
+    ? `You KNOW the secret word: "${input.secretWord}" (category: ${input.category}).
+
+THREAT MODEL: One player at the table is an imposter who does not know the word. The imposter sees the category and every clue, and will try to piece the word together. If your clue lets someone derive the word from the category plus clues, you have handed the game to the imposter. Your goal is a clue that only makes sense AFTER you know the word, never one that points toward it.
+
+Example for secret word "Pizza": "Slice", "Oven", "Cheese" are BAD because they lead straight to the answer. "Friday", "Argument", "Cardboard" are GOOD because they are meaningless to the imposter but click for anyone who knows the word.
+
+Difficulty rules you must follow:
+${DIFFICULTY_RULES[input.difficulty]}
+
+Do not repeat the theme of an earlier clue. If earlier clues already point in one direction, pick a different angle. This is round ${round}; with each round the imposter has more information, so be more oblique than the clues before you.`
+    : `You are the IMPOSTER. You do NOT know the secret word. You only know the category: "${input.category}".
+
+Study the clues so far and form a private guess about what the word might be. Then give a clue that would plausibly fit that guess AND also fit several other words in the category, so you blend in whether or not your guess is right. Avoid generic words that fit anything (e.g. "Nice", "Thing", "Good"), because real players will notice you are hedging. Mirror the specificity level of the other clues.`;
+
+  return `You are ${input.playerName} in a social deduction word game. Each player says exactly one word as a clue.
+
+${roleBrief}
+
+Hard rules:
+- Exactly one word, no spaces, no hyphenated compounds.
+- Never use the secret word, any part of it, a plural, a translation, a rhyme, or an obvious spelling variant.
+- Never repeat a word already used as a clue.
 
 Clues so far:
 ${history}
 ${correction}
 
-Return JSON only with one field named clue.`;
+First write one sentence in "reason" explaining why the imposter could not derive the word from this clue (or, as imposter, why this clue blends in). Then give the clue in "clue". Return JSON only.`;
 }
 
 async function generateClue(env: Env, input: BotClueRequest): Promise<BotClueResponse> {
   if (!input.playerName || !input.category || !Array.isArray(input.previousClues)) throw new ApiError("Invalid clue request", 400);
   if (input.role === "player" && !input.secretWord) throw new ApiError("Player is missing the secret word", 400);
   const used = new Set(input.previousClues.map(c => c.word.toLowerCase()));
-  const schema = { type: "object", properties: { clue: { type: "string" } }, required: ["clue"], additionalProperties: false };
+  const schema = { type: "object", properties: { reason: { type: "string" }, clue: { type: "string" } }, required: ["reason", "clue"], additionalProperties: false, propertyOrdering: ["reason", "clue"] };
   let correction = "";
   for (let attempt = 0; attempt < 2; attempt++) {
-    const result = await callGemini<BotClueResponse>(env, cluePrompt(input, correction), schema);
+    const result = await callGemini<BotClueResponse & { reason?: string }>(env, cluePrompt(input, correction), schema);
     const clue = oneWord(result.clue);
-    const isSecret = Boolean(input.secretWord && clue?.toLowerCase() === input.secretWord.toLowerCase());
-    if (clue && !isSecret && !used.has(clue.toLowerCase())) return { clue };
-    correction = "Your last answer was invalid, repeated, or revealed the secret. Choose a different single word.";
+    const secret = input.secretWord?.toLowerCase();
+    const lower = clue?.toLowerCase() ?? "";
+    const revealsSecret = Boolean(secret && (lower === secret || lower.includes(secret) || secret.includes(lower)));
+    if (clue && !revealsSecret && !used.has(lower)) return { clue };
+    correction = `\nYour previous answer "${result.clue}" was rejected: it was not a single word, repeated an earlier clue, or contained the secret word. Choose a completely different single word.`;
   }
   throw new ApiError("Gemini could not produce a valid clue", 502);
 }
